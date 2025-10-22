@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-gray-50">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>LeapToSuccess Strategic Alliance Scoreboard</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    // Tailwind config for brand colors
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            leaptoblue: '#0078B5',
+            leptored: '#D82C2C',
+            leptogray: '#4D4D4D',
+            alliancegreen: '#16A34A',
+            allianceyellow: '#EAB308',
+            alliancered: '#D82C2C'
+          },
+          fontFamily: {
+            sans: ['Inter', 'ui-sans-serif', 'system-ui']
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="icon" href="data:,">
+</head>
+<body class="h-full min-h-screen font-sans bg-gray-50 flex flex-col">
+  <!-- App Container -->
+  <div id="app" class="min-h-screen flex flex-col"></div>
+
+  <!-- Loading Spinner Modal -->
+  <div id="loadingModal" class="fixed inset-0 z-50 flex items-center justify-center bg-white bg-opacity-90">
+    <div class="flex flex-col items-center gap-4">
+      <svg class="animate-spin h-14 w-14 text-leaptoblue" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="#0078B5" stroke-width="4"></circle>
+        <path class="opacity-75" fill="#D82C2C" d="M4 12a8 8 0 018-8v8z"></path>
+      </svg>
+      <span class="text-leaptogray text-xl font-semibold">Connecting to Firebase and Loading Data...</span>
+    </div>
+  </div>
+
+  <script type="module">
+    // --- CONFIGURATION VARIABLES ---
+    // Assume these are globally available
+    // window.__app_id
+    // window.__firebase_config
+    // window.__initial_auth_token
+
+    // --- FIREBASE & INITIALIZATION ---
+
+    // Firebase CDN imports
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+    import {
+      getAuth,
+      signInWithCustomToken,
+      signInAnonymously,
+      setPersistence,
+      browserLocalPersistence
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+    import {
+      getFirestore,
+      doc,
+      getDoc,
+      setDoc,
+      collection,
+      getDocs,
+      onSnapshot,
+      updateDoc,
+      addDoc,
+      query,
+      orderBy,
+      serverTimestamp,
+      writeBatch
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+    // --- CONSTANTS ---
+    const PILLARS = [
+      { key: "Product", weight: 0.20 },
+      { key: "Delivery", weight: 0.25 },
+      { key: "Service", weight: 0.25 },
+      { key: "Relationship", weight: 0.30 }
+    ];
+    const TEAMS = ["Team A", "Team B", "Team C", "Team D"];
+    const BEHAVIORS = [
+      "Product: Meets Market Needs", "Product: Quality Standards", "Product: Innovation",
+      "Delivery: Timeliness", "Delivery: Accuracy", "Delivery: Flexibility",
+      "Service: Responsiveness", "Service: Knowledge", "Service: Support Effectiveness",
+      "Relationship: Communication", "Relationship: Trust", "Relationship: Collaboration"
+    ];
+    const BEHAVIOR_TO_PILLAR = [0,0,0,1,1,1,2,2,2,3,3,3];
+    const LOADING_MODAL_ID = "loadingModal";
+    const APP_ID = window.__app_id || "lts-alliance-scoreboard";
+    const FIREBASE_CONFIG = window.__firebase_config;
+    const INITIAL_AUTH_TOKEN = window.__initial_auth_token;
+
+    // --- STATE ---
+    let userRole = "Trainer";
+    let userTeam = "Trainer";
+    let weights = null;
+    let allTeamData = null; // { [teamName]: { ... } }
+    let unsubscribeListeners = [];
+    let allianceLedger = [];
+    let aiActionLoading = false;
+    let selectedTab = "Leaderboard"; // Default tab
+    let settingsEditing = false;
+
+    // --- FIREBASE INIT ---
+    let app, auth, db, currentUser;
+    async function firebaseInit() {
+      app = initializeApp(FIREBASE_CONFIG);
+      auth = getAuth(app);
+      db = getFirestore(app);
+      await setPersistence(auth, browserLocalPersistence);
+      // Prefer custom token, fallback to anonymous
+      let userCred;
+      try {
+        if (INITIAL_AUTH_TOKEN)
+          userCred = await signInWithCustomToken(auth, INITIAL_AUTH_TOKEN);
+        else
+          userCred = await signInAnonymously(auth);
+      } catch (e) {
+        userCred = await signInAnonymously(auth);
+      }
+      currentUser = userCred.user;
+    }
+
+    // --- DATA SEEDING ---
+    async function seedInitialData() {
+      // Seed weights if missing
+      const weightsDocRef = doc(db, "public/data/scoreboard_config", "weights");
+      const weightsSnap = await getDoc(weightsDocRef);
+      if (!weightsSnap.exists()) {
+        const initialWeights = {
+          Product: 0.20, Delivery: 0.25, Service: 0.25, Relationship: 0.30,
+          updatedAt: serverTimestamp()
+        };
+        await setDoc(weightsDocRef, initialWeights);
+      }
+      // Seed team_inputs if missing
+      const teamsCol = collection(db, "public/data/team_inputs");
+      const teamsSnap = await getDocs(teamsCol);
+      if (teamsSnap.empty) {
+        let batch = writeBatch(db);
+        for (const team of TEAMS) {
+          // 12 behaviors, placeholder scores (cycle 3/5), evidenceFactor 1.0
+          const scores = Array(12).fill(null).map((_, i) => (i%2 === 0 ? 3 : 5));
+          const docRef = doc(teamsCol, team);
+          batch.set(docRef, {
+            teamName: team,
+            scores,
+            evidenceFactor: 1.0,
+            updatedAt: serverTimestamp()
+          });
+        }
+        await batch.commit();
+      }
+    }
+
+    // --- REALTIME DATA STREAMING ---
+    function subscribeToData(onDataLoaded) {
+      // Listen to weights
+      const weightsDocRef = doc(db, "public/data/scoreboard_config", "weights");
+      let weightsLoaded = false, teamsLoaded = false, ledgerLoaded = false;
+      let tmpWeights = null, tmpTeams = {}, tmpLedger = [];
+      const checkAllLoaded = () => {
+        if (weightsLoaded && teamsLoaded && ledgerLoaded) {
+          onDataLoaded(tmpWeights, tmpTeams, tmpLedger);
+        }
+      };
+      // Weights
+      unsubscribeListeners.push(onSnapshot(weightsDocRef, (docSnap) => {
+        tmpWeights = docSnap.data();
+        weightsLoaded = true;
+        checkAllLoaded();
+      }));
+      // Teams
+      const teamsCol = collection(db, "public/data/team_inputs");
+      unsubscribeListeners.push(onSnapshot(teamsCol, (querySnap) => {
+        tmpTeams = {};
+        querySnap.forEach(doc => {
+          tmpTeams[doc.id] = doc.data();
+        });
+        teamsLoaded = true;
+        checkAllLoaded();
+      }));
+      // Alliance Ledger
+      const ledgerCol = collection(db, "public/data/alliance_ledger");
+      const q = query(ledgerCol, orderBy("createdAt", "desc"));
+      unsubscribeListeners.push(onSnapshot(q, (querySnap) => {
+        tmpLedger = [];
+        querySnap.forEach(doc => tmpLedger.push({id: doc.id, ...doc.data()}));
+        ledgerLoaded = true;
+        checkAllLoaded();
+      }));
+    }
+
+    // --- UI RENDER FUNCTIONS ---
+    function showLoading(show = true) {
+      document.getElementById(LOADING_MODAL_ID).style.display = show ? "flex" : "none";
+    }
+    function setAppHTML(html) {
+      document.getElementById("app").innerHTML = html;
+    }
+    function rerender() {
+      renderApp();
+    }
+
+    // --- SCORE & RANK LOGIC ---
+    function calcPillarAverages(team) {
+      // 3 behaviors per pillar
+      const scores = team.scores || [];
+      let avgs = [];
+      for (let p = 0; p < 4; ++p) {
+        const s = scores.slice(p*3, p*3+3);
+        avgs.push(s.length ? (s.reduce((a,b)=>a+b,0)/s.length) : 0);
+      }
+      return avgs;
+    }
+    function calcAccountHealth(team, weights) {
+      const pillarAvgs = calcPillarAverages(team);
+      const w = [weights.Product, weights.Delivery, weights.Service, weights.Relationship];
+      let sumproduct = w.reduce((acc, cv, i) => acc + cv * pillarAvgs[i], 0);
+      let result = Math.round(20 * sumproduct * (team.evidenceFactor || 1));
+      return result;
+    }
+    function getTeamRankings(teamObj, weights) {
+      // Returns array of {teamName, accountHealth, ...}
+      let scores = [];
+      for (let t of TEAMS) {
+        let team = teamObj[t];
+        if (!team) continue;
+        let ah = calcAccountHealth(team, weights);
+        scores.push({teamName: t, accountHealth: ah, team});
+      }
+      // RANK.EQ logic (same score, same rank)
+      scores.sort((a,b)=>b.accountHealth-a.accountHealth);
+      let currentRank = 1, prevScore = null, ranks = {};
+      for (let i = 0; i < scores.length; ++i) {
+        let s = scores[i];
+        if (prevScore !== null && s.accountHealth !== prevScore) {
+          currentRank = i+1;
+        }
+        ranks[s.teamName] = currentRank;
+        prevScore = s.accountHealth;
+      }
+      scores.forEach(s => s.rank = ranks[s.teamName]);
+      return scores;
+    }
+    function ragColor(score) {
+      if (score >= 80) return "alliancegreen";
+      if (score >= 60) return "allianceyellow";
+      return "alliancered";
+    }
+    function ragText(score) {
+      if (score >= 80) return "Green";
+      if (score >= 60) return "Yellow";
+      return "Red";
+    }
+
+    // --- TAB RENDERERS ---
+    function renderTabs(activeTab) {
+      const tabs = [
+        { key: "Leaderboard", label: "Leaderboard" },
+        { key: "Behaviors", label: "Behaviors" },
+        { key: "Settings", label: "Settings" },
+        { key: "AllianceLedger", label: "Alliance Ledger" }
+      ];
+      return `<div class="flex flex-wrap gap-2 bg-white px-2 py-3 rounded-t-md border-b">
+        ${tabs.map(tab => `
+          <button type="button"
+            class="px-4 py-2 rounded-md font-semibold transition border-b-2 ${activeTab === tab.key ? 'text-leaptoblue border-leaptoblue bg-blue-50' : 'text-leptogray border-transparent hover:bg-gray-100'}"
+            onclick="window.setActiveTab('${tab.key}')"
+          >${tab.label}</button>
+        `).join("")}
+      </div>`;
+    }
+
+    // --- LEADERBOARD TAB ---
+    function renderLeaderboard(weights, allTeamData) {
+      const scores = getTeamRankings(allTeamData, weights);
+      return `
+      <div class="p-4">
+        <h2 class="text-2xl font-bold mb-4 text-leaptoblue">Account Health Leaderboard</h2>
+        <div class="overflow-x-auto rounded-lg shadow border bg-white">
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr class="bg-blue-50 text-leaptoblue">
+                <th class="px-3 py-2 text-left">Rank</th>
+                <th class="px-3 py-2 text-left">Team</th>
+                <th class="px-3 py-2 text-left">Account Health</th>
+                <th class="px-3 py-2 text-left">RAG Status</th>
+                <th class="px-3 py-2 text-left">Evidence Factor</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${scores.map(s => `
+              <tr class="border-t text-leptogray">
+                <td class="px-3 py-2 font-semibold">${s.rank}</td>
+                <td class="px-3 py-2">${s.teamName}</td>
+                <td class="px-3 py-2 font-bold">${s.accountHealth}</td>
+                <td class="px-3 py-2">
+                  <span class="rounded px-2 py-1 font-semibold bg-${ragColor(s.accountHealth)}/10 text-${ragColor(s.accountHealth)}">${ragText(s.accountHealth)}</span>
+                </td>
+                <td class="px-3 py-2">${(s.team.evidenceFactor || 1).toFixed(2)}</td>
+              </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+        <div class="mt-8">
+          <h3 class="text-xl font-semibold text-leaptoblue mb-2">Behavior Scores Grid</h3>
+          <div class="overflow-x-auto rounded-lg border bg-white max-w-full">
+            <table class="min-w-[800px] text-xs">
+              <thead>
+                <tr>
+                  <th class="px-2 py-1 bg-gray-100"></th>
+                  ${BEHAVIORS.map((b, i) => `<th class="px-2 py-1 bg-gray-100">${b}</th>`).join("")}
+                </tr>
+              </thead>
+              <tbody>
+                ${TEAMS.map(team => `
+                  <tr>
+                    <td class="px-2 py-1 font-semibold text-leaptoblue">${team}</td>
+                    ${(allTeamData[team]?.scores || Array(12).fill("")).map((score, i) => `
+                      <td class="px-2 py-1 text-center">${score || ""}</td>
+                    `).join("")}
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>`;
+    }
+
+    // --- BEHAVIORS TAB ---
+    function renderBehaviors(weights, allTeamData) {
+      // For Trainer, let them pick a team to view/edit if desired (future: now just show all)
+      // For each team, show pillar averages and behaviors
+      let html = `
+      <div class="p-4">
+        <h2 class="text-2xl font-bold mb-4 text-leaptoblue">Behaviors by Team & Pillar</h2>
+        <div class="flex flex-wrap gap-6">
+        ${TEAMS.map(team => {
+          const data = allTeamData[team];
+          if (!data) return "";
+          const pillarAvgs = calcPillarAverages(data);
+          // Show pillar averages and AI Improvement Coach button if needed
+          let pillarBtns = PILLARS.map((pillar, i) => {
+            let avg = pillarAvgs[i] || 0;
+            const belowThreshold = avg < 3.5;
+            return `
+              <div class="flex items-center gap-2">
+                <span class="font-semibold text-leaptoblue">${pillar.key}</span>
+                <span class="rounded px-2 py-1 bg-gray-100 font-mono">${avg.toFixed(2)}/5</span>
+                ${userRole === "Trainer" && belowThreshold && !aiActionLoading ?
+                  `<button class="ml-2 px-2 py-1 bg-leptored text-white rounded hover:bg-red-700 transition"
+                  onclick="window.triggerAIAction('${team}',${i})">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="inline w-4 h-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m0-4h.01"/></svg>
+                    AI Improvement Coach
+                  </button>`
+                  : ""}
+              </div>
+            `;
+          }).join("");
+          // Behavior scores grid for the team
+          return `
+          <div class="bg-white rounded-lg shadow border p-4 flex-1 min-w-[340px] max-w-full">
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="text-lg font-semibold text-leaptoblue">${team}</h3>
+              <div class="flex gap-4">${pillarBtns}</div>
+            </div>
+            <div class="overflow-x-auto">
+              <table class="min-w-full text-sm">
+                <thead>
+                  <tr>
+                    ${BEHAVIORS.map((b,i) => `<th class="px-2 py-1 bg-gray-100">${b}</th>`).join("")}
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                  ${(data.scores || []).map((score,i) => `
+                    <td class="px-2 py-1 text-center">
+                      <span>${score}</span>
+                    </td>
+                  `).join("")}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="mt-2 text-right">
+              <span class="text-leptogray text-xs">Evidence Factor: <b>${(data.evidenceFactor||1).toFixed(2)}</b></span>
+            </div>
+          </div>
+          `;
+        }).join("")}
+        </div>
+        ${aiActionLoading ? `
+          <div class="fixed inset-0 flex items-center justify-center bg-black/30 z-50">
+            <div class="bg-white rounded-lg shadow-lg p-8 flex flex-col items-center gap-4">
+              <svg class="animate-spin h-8 w-8 text-leaptoblue" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="#0078B5" stroke-width="4"></circle>
+                <path class="opacity-75" fill="#D82C2C" d="M4 12a8 8 0 018-8v8z"></path>
+              </svg>
+              <span class="text-leaptogray text-lg font-semibold">AI Coach is generating... Please wait</span>
+            </div>
+          </div>
+        ` : ""}
+      </div>
+      `;
+      return html;
+    }
+
+    // --- SETTINGS TAB ---
+    function renderSettings(weights) {
+      return `
+      <div class="p-4 max-w-xl mx-auto">
+        <h2 class="text-2xl font-bold mb-4 text-leaptoblue">Pillar Weights</h2>
+        <form id="pillarWeightsForm" class="bg-white rounded-lg shadow border p-6 flex flex-col gap-4"
+          onsubmit="window.handleSettingsSave(event)">
+          ${PILLARS.map(pillar => `
+            <div class="flex items-center gap-3">
+              <label class="w-32 text-leaptoblue font-semibold">${pillar.key}</label>
+              <input type="number" name="${pillar.key}" min="0" max="1" step="0.01" ${settingsEditing ? "":"readonly"}
+                value="${weights[pillar.key] || pillar.weight}" class="border px-2 py-1 rounded w-24 text-right ${settingsEditing ? "bg-white" : "bg-gray-100"}"/>
+              <span class="text-leptogray text-xs">(${(pillar.weight*100).toFixed(0)}%)</span>
+            </div>
+          `).join("")}
+          <div class="flex justify-end gap-3 mt-2">
+            ${settingsEditing
+              ? `<button type="button" onclick="window.setSettingsEditing(false)" class="px-4 py-2 rounded bg-gray-100 text-leptogray border font-semibold">Cancel</button>
+                 <button type="submit" class="px-4 py-2 rounded bg-leaptoblue text-white font-semibold hover:bg-blue-700">Save</button>`
+              : `<button type="button" onclick="window.setSettingsEditing(true)" class="px-4 py-2 rounded bg-leaptoblue text-white font-semibold hover:bg-blue-700">Edit</button>`
+            }
+          </div>
+        </form>
+      </div>
+      `;
+    }
+
+    // --- ALLIANCE LEDGER TAB ---
+    function renderLedger(ledger) {
+      return `
+      <div class="p-4 max-w-3xl mx-auto">
+        <h2 class="text-2xl font-bold mb-4 text-leaptoblue">Alliance Ledger</h2>
+        <div class="overflow-x-auto rounded-lg border bg-white">
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr>
+                <th class="px-3 py-2 bg-gray-100">Date</th>
+                <th class="px-3 py-2 bg-gray-100">Team</th>
+                <th class="px-3 py-2 bg-gray-100">Area</th>
+                <th class="px-3 py-2 bg-gray-100">Action</th>
+                <th class="px-3 py-2 bg-gray-100">KPI</th>
+                <th class="px-3 py-2 bg-gray-100">Timeline</th>
+                <th class="px-3 py-2 bg-gray-100">Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${ledger.length === 0 ? `
+                <tr><td colspan="7" class="px-3 py-2 text-center text-leptogray">No action items yet.</td></tr>
+              ` : ledger.map(row => `
+                <tr class="border-t">
+                  <td class="px-3 py-2">${row.createdAt?.toDate ? row.createdAt.toDate().toLocaleDateString() : ""}</td>
+                  <td class="px-3 py-2">${row.teamName || ""}</td>
+                  <td class="px-3 py-2">${row.area || ""}</td>
+                  <td class="px-3 py-2">${row.action || ""}</td>
+                  <td class="px-3 py-2">${row.kpi || ""}</td>
+                  <td class="px-3 py-2">${row.timeline || ""}</td>
+                  <td class="px-3 py-2 text-xs">${row.source || ""}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      `;
+    }
+
+    // --- MAIN APP RENDER ---
+    function renderApp() {
+      if (!weights || !allTeamData) return;
+      let html = `
+      <header class="flex items-center justify-between px-6 py-4 bg-leaptoblue text-white shadow">
+        <h1 class="text-2xl font-black tracking-tight flex items-center gap-3">
+          <span class="rounded-full bg-white/10 px-3 py-1 text-leptored font-bold text-lg">LeapToSuccess</span>
+          Strategic Alliance Scoreboard
+        </h1>
+        <span class="font-semibold">Role: <b>${userRole}</b></span>
+      </header>
+      <main class="flex-1 flex flex-col bg-gray-50">
+        <section class="container mx-auto mt-6 rounded-lg bg-white shadow border">
+          ${renderTabs(selectedTab)}
+          <div class="mt-1">
+            ${
+              selectedTab === "Leaderboard" ? renderLeaderboard(weights, allTeamData) :
+              selectedTab === "Behaviors" ? renderBehaviors(weights, allTeamData) :
+              selectedTab === "Settings" ? renderSettings(weights) :
+              selectedTab === "AllianceLedger" ? renderLedger(allianceLedger) :
+              ""
+            }
+          </div>
+        </section>
+      </main>
+      <footer class="flex items-center justify-center py-5 bg-leptogray text-white text-xs rounded-t-lg mt-10">
+        LeapToSuccess &copy; ${new Date().getFullYear()}
+      </footer>
+      `;
+      setAppHTML(html);
+    }
+
+    // --- EXPOSED UI EVENT HANDLERS ---
+    window.setActiveTab = function(tab) {
+      selectedTab = tab;
+      rerender();
+    }
+    window.setSettingsEditing = function(val) {
+      settingsEditing = val;
+      rerender();
+    }
+    window.handleSettingsSave = async function(evt) {
+      evt.preventDefault();
+      let form = evt.target;
+      let newWeights = {};
+      let sum = 0;
+      for (let pillar of PILLARS) {
+        let val = parseFloat(form[pillar.key].value);
+        if (isNaN(val) || val < 0) val = pillar.weight;
+        newWeights[pillar.key] = Math.round(val*100)/100;
+        sum += newWeights[pillar.key];
+      }
+      if (Math.abs(sum - 1.0) > 0.001) {
+        alert("Total of weights must sum to 1.0");
+        return;
+      }
+      const weightsDocRef = doc(db, "public/data/scoreboard_config", "weights");
+      await updateDoc(weightsDocRef, {
+        ...newWeights,
+        updatedAt: serverTimestamp()
+      });
+      settingsEditing = false;
+      rerender();
+    }
+
+    // --- AI IMPROVEMENT COACH LOGIC ---
+    window.triggerAIAction = async function(teamName, pillarIdx) {
+      aiActionLoading = true;
+      rerender();
+      try {
+        // Gather context for Gemini
+        const data = allTeamData[teamName];
+        const pillar = PILLARS[pillarIdx];
+        const scores = data.scores.slice(pillarIdx*3, pillarIdx*3+3);
+        const behaviorLabels = BEHAVIORS.slice(pillarIdx*3, pillarIdx*3+3);
+        // Construct prompt
+        const prompt = `
+You are an expert strategic alliance coach. Analyze the following team's pillar performance and generate a 3-step improvement plan.
+
+Team: ${teamName}
+Pillar: ${pillar.key}
+Scores for behaviors:
+${behaviorLabels.map((b, i) => `- ${b}: ${scores[i] || ""}/5`).join("\n")}
+
+Give your response as a JSON array with three objects, each with fields: area, action, kpi, timeline.
+
+Example:
+[
+  {"area":"Area 1", "action":"Action 1", "kpi":"KPI 1", "timeline":"Timeline 1"},
+  {"area":"Area 2", "action":"Action 2", "kpi":"KPI 2", "timeline":"Timeline 2"},
+  {"area":"Area 3", "action":"Action 3", "kpi":"KPI 3", "timeline":"Timeline 3"}
+]
+Respond ONLY with valid JSON array.`;
+
+        // Call Gemini (simulate API call here, or implement your own endpoint)
+        // Replace with your actual endpoint and auth as required
+        let geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=YOUR_API_KEY";
+        // If you have a proxy or backend endpoint, replace accordingly.
+        // For demo, we simulate a plausible output after delay
+        let resultArr = null;
+        try {
+          // --- BEGIN GEMINI CALL ---
+          const response = await fetchGeminiWithBackoff(prompt, 3);
+          // Try parsing JSON from response
+          if (typeof response === "string") {
+            resultArr = JSON.parse(response);
+          } else if (response && typeof response === "object" && Array.isArray(response)) {
+            resultArr = response;
+          } else if (response && response.candidates && response.candidates.length > 0) {
+            // Gemini JSON structure
+            const text = response.candidates[0].content?.parts?.[0]?.text || response.candidates[0].content?.text || "";
+            resultArr = JSON.parse(text);
+          } else {
+            throw new Error("AI response unrecognized");
+          }
+        } catch (e) {
+          // Fallback: plausible defaults
+          resultArr = [
+            { area: "Communication", action: "Establish regular feedback sessions", kpi: "Biweekly feedback participation", timeline: "Next 2 months" },
+            { area: "Trust", action: "Share success stories across teams", kpi: "Number of stories shared", timeline: "6 weeks" },
+            { area: "Collaboration", action: "Launch cross-team workshops", kpi: "Workshop attendance", timeline: "Next quarter" }
+          ];
+        }
+
+        // --- AUTO-COMMIT TO LEDGER ---
+        if (resultArr && Array.isArray(resultArr)) {
+          const ledgerCol = collection(db, "public/data/alliance_ledger");
+          for (const item of resultArr) {
+            await addDoc(ledgerCol, {
+              teamName,
+              area: item.area,
+              action: item.action,
+              kpi: item.kpi,
+              timeline: item.timeline,
+              createdAt: serverTimestamp(),
+              source: "AI Coach",
+              pillar: pillar.key
+            });
+          }
+        }
+      } catch (e) {
+        alert("AI Coach failed: " + e.message);
+      }
+      aiActionLoading = false;
+      rerender();
+    };
+
+    // --- GEMINI BACKOFF FETCH ---
+    async function fetchGeminiWithBackoff(prompt, retries = 3, delay = 1500) {
+      // NOTE: Replace with your Gemini endpoint and API key!
+      // This demo returns a fake result.
+      /*
+      const apiKey = "YOUR_API_KEY";
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+      const body = {
+        contents: [{parts: [{text: prompt}]}],
+        generationConfig: { temperature: 0.6, responseSchema: {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "area": { "type": "string" },
+              "action": { "type": "string" },
+              "kpi": { "type": "string" },
+              "timeline": { "type": "string" }
+            },
+            "required": ["area","action","kpi","timeline"]
+          }
+        }}
+      };
+      for (let i = 0; i < retries; ++i) {
+        try {
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify(body)
+          });
+          if (!resp.ok) throw new Error("Gemini HTTP " + resp.status);
+          const data = await resp.json();
+          return data;
+        } catch (e) {
+          if (i === retries-1) throw e;
+          await new Promise(res => setTimeout(res, delay * Math.pow(2,i)));
+        }
+      }
+      */
+      // --- DEMO SIMULATION ---
+      await new Promise(res => setTimeout(res, 1400));
+      return [
+        { area: "Pillar Process", action: "Review weekly with leadership", kpi: "Reviewed agendas", timeline: "30 days" },
+        { area: "Team Engagement", action: "Run focused training", kpi: "Sessions completed", timeline: "60 days" },
+        { area: "Data Transparency", action: "Share metrics openly", kpi: "Dashboard usage", timeline: "90 days" }
+      ];
+    }
+
+    // --- STARTUP LOGIC ---
+    showLoading(true);
+    await firebaseInit();
+    await seedInitialData();
+    subscribeToData((w, teams, ledger) => {
+      weights = w;
+      allTeamData = teams;
+      allianceLedger = ledger;
+      showLoading(false);
+      rerender();
+    });
+
+    // --- INITIAL GLOBALS FOR HANDLERS ---
+    window.setActiveTab = window.setActiveTab;
+    window.setSettingsEditing = window.setSettingsEditing;
+    window.handleSettingsSave = window.handleSettingsSave;
+    window.triggerAIAction = window.triggerAIAction;
+
+    // --- CLEANUP ON UNLOAD ---
+    window.addEventListener("beforeunload", () => {
+      unsubscribeListeners.forEach(fn => typeof fn === "function" && fn());
+    });
+  </script>
+</body>
+</html>
